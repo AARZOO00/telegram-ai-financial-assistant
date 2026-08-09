@@ -2,6 +2,7 @@ import os
 import json
 import time
 import traceback
+import re
 from groq import Groq
 from sqlalchemy.orm import Session
 from app.db.models import User, Message
@@ -11,9 +12,7 @@ MODEL_NAME = "llama-3.3-70b-versatile"
 VISION_MODEL_NAME = "llama-3.2-90b-vision-preview"
 
 SYSTEM_PROMPT = """You are an experienced financial analyst and executive assistant. Be concise, natural, and conversational. Never use bullet-point dumps unless genuinely useful. Ask clarifying questions when a request is ambiguous (e.g. 'Tell me about Apple' -> ask if they want news, financials, valuation, or filings).
-For new users, naturally ask 2-3 onboarding questions in ONE flowing conversation (not a form): ask about their role, companies/sectors followed, and preferred briefing time. They can say 'skip' anytime.
-CRITICAL INSTRUCTION FOR TOOL USE: When you call a tool, you MUST use the correct syntax. Specifically, you must ensure there is a `>` character closing the function name BEFORE the arguments JSON. Example: `<function=get_stock_price>{"ticker": "AAPL"}</function>`. Do NOT omit the closing `>`.
-"""
+For new users, naturally ask 2-3 onboarding questions in ONE flowing conversation (not a form): ask about their role, companies/sectors followed, and preferred briefing time. They can say 'skip' anytime."""
 
 # Define tools in OpenAI JSON schema format
 GROQ_TOOLS = [
@@ -196,67 +195,128 @@ def process_message(db: Session, telegram_id: int, user_name: str, content: str,
             
             response_message = response.choices[0].message
             
-            while response_message.tool_calls:
-                # Add assistant message with tool calls to history safely
-                assistant_msg = {
-                    "role": "assistant",
-                    "content": response_message.content,
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments
-                            }
-                        } for tc in response_message.tool_calls
-                    ]
-                }
-                messages.append(assistant_msg)
-                
-                for tool_call in response_message.tool_calls:
-                    tool_name = tool_call.function.name
-                    try:
-                        tool_args = json.loads(tool_call.function.arguments)
-                    except json.JSONDecodeError:
-                        tool_args = {}
-                        
-                    if tool_name == "update_user_preference":
-                        key = tool_args.get("key")
-                        val = tool_args.get("value")
-                        prefs_dict = dict(user.preferences_json) if user.preferences_json else {}
-                        if key and val:
-                            prefs_dict[key] = val
-                            user.preferences_json = prefs_dict
-                            db.query(User).filter(User.id == user.id).update({"preferences_json": prefs_dict})
-                            db.commit()
-                        result = json.dumps({"status": "success", "key": key, "value": val})
-                    else:
-                        if tool_name in TOOLS_MAP:
-                            try:
-                                result = TOOLS_MAP[tool_name](**tool_args)
-                            except Exception as e:
-                                result = f"Error running tool: {str(e)}"
-                        else:
-                            result = f"Error: Tool {tool_name} not found."
+            while True:
+                if response_message.tool_calls:
+                    # Add assistant message with tool calls to history safely
+                    assistant_msg = {
+                        "role": "assistant",
+                        "content": response_message.content,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments
+                                }
+                            } for tc in response_message.tool_calls
+                        ]
+                    }
+                    messages.append(assistant_msg)
                     
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "name": tool_name,
-                        "content": str(result)
-                    })
+                    for tool_call in response_message.tool_calls:
+                        tool_name = tool_call.function.name
+                        try:
+                            tool_args = json.loads(tool_call.function.arguments)
+                        except json.JSONDecodeError:
+                            tool_args = {}
+                            
+                        if tool_name == "update_user_preference":
+                            key = tool_args.get("key")
+                            val = tool_args.get("value")
+                            prefs_dict = dict(user.preferences_json) if user.preferences_json else {}
+                            if key and val:
+                                prefs_dict[key] = val
+                                user.preferences_json = prefs_dict
+                                db.query(User).filter(User.id == user.id).update({"preferences_json": prefs_dict})
+                                db.commit()
+                            result = json.dumps({"status": "success", "key": key, "value": val})
+                        else:
+                            if tool_name in TOOLS_MAP:
+                                try:
+                                    result = TOOLS_MAP[tool_name](**tool_args)
+                                except Exception as e:
+                                    result = f"Error running tool: {str(e)}"
+                            else:
+                                result = f"Error: Tool {tool_name} not found."
+                        
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_name,
+                            "content": str(result)
+                        })
+                    
+                    # Call Groq again with the tool results
+                    response = client.chat.completions.create(
+                        model=current_model,
+                        messages=messages,
+                        tools=GROQ_TOOLS,
+                        tool_choice="auto",
+                        parallel_tool_calls=False
+                    )
+                    response_message = response.choices[0].message
+                    continue
                 
-                # Call Groq again with the tool results
-                response = client.chat.completions.create(
-                    model=current_model,
-                    messages=messages,
-                    tools=GROQ_TOOLS,
-                    tool_choice="auto"
-                )
-                response_message = response.choices[0].message
+                # Check for leaked tool calls in the content
+                elif response_message.content and "<function=" in response_message.content:
+                    pattern = r"<function=([a-zA-Z0-9_]+)[>\(]*(.*?)[<\)]*/?function>"
+                    matches = list(re.finditer(pattern, response_message.content, re.DOTALL))
+                    if matches:
+                        messages.append({"role": "assistant", "content": response_message.content})
+                        
+                        for m in matches:
+                            tool_name = m.group(1)
+                            tool_args_str = m.group(2)
+                            try:
+                                tool_args = json.loads(tool_args_str)
+                            except json.JSONDecodeError:
+                                tool_args = {}
+                                
+                            if tool_name == "update_user_preference":
+                                key = tool_args.get("key")
+                                val = tool_args.get("value")
+                                prefs_dict = dict(user.preferences_json) if user.preferences_json else {}
+                                if key and val:
+                                    prefs_dict[key] = val
+                                    user.preferences_json = prefs_dict
+                                    db.query(User).filter(User.id == user.id).update({"preferences_json": prefs_dict})
+                                    db.commit()
+                                result = json.dumps({"status": "success", "key": key, "value": val})
+                            else:
+                                if tool_name in TOOLS_MAP:
+                                    try:
+                                        result = TOOLS_MAP[tool_name](**tool_args)
+                                    except Exception as e:
+                                        result = f"Error running tool: {str(e)}"
+                                else:
+                                    result = f"Error: Tool {tool_name} not found."
+                            
+                            # Append result as user message to feed back to the model
+                            messages.append({
+                                "role": "user",
+                                "content": f"System Action: Tool '{tool_name}' executed. Result: {result}"
+                            })
+                            
+                        response = client.chat.completions.create(
+                            model=current_model,
+                            messages=messages,
+                            tools=GROQ_TOOLS,
+                            tool_choice="auto",
+                            parallel_tool_calls=False
+                        )
+                        response_message = response.choices[0].message
+                        continue
+                        
+                # No more tools to call
+                break
                 
             final_text = response_message.content
+            
+            # 5. Clean up any lingering raw function tags before showing to user
+            if final_text:
+                final_text = re.sub(r"<function=.*?</function>", "", final_text, flags=re.DOTALL)
+                final_text = final_text.strip()
             
             # 5. Save Assistant response
             asst_msg = Message(user_id=user.id, role="assistant", content=final_text)
