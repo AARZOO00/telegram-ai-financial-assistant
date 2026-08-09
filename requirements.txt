@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+python-telegram-bot
+sqlalchemy
+groq
+yfinance
+duckduckgo-search
+pypdf
+apscheduler
+requests
+openai
