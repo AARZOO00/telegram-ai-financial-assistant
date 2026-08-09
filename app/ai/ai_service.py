@@ -176,7 +176,9 @@ def process_message(db: Session, telegram_id: int, user_name: str, content: str,
     # Use Vision model for images, otherwise default Versatile model
     current_model = VISION_MODEL_NAME if image_data else MODEL_NAME
     
-    for attempt in range(2):
+    rate_limit_retries = 0
+    
+    while True:
         try:
             if image_data:
                 # Vision model doesn't support tools on Groq currently
@@ -195,29 +197,77 @@ def process_message(db: Session, telegram_id: int, user_name: str, content: str,
             
             response_message = response.choices[0].message
             
-            while True:
-                if response_message.tool_calls:
-                    # Add assistant message with tool calls to history safely
-                    assistant_msg = {
-                        "role": "assistant",
-                        "content": response_message.content,
-                        "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.function.name,
-                                    "arguments": tc.function.arguments
-                                }
-                            } for tc in response_message.tool_calls
-                        ]
-                    }
-                    messages.append(assistant_msg)
+            has_tools = False
+            
+            # Handle native tools
+            if hasattr(response_message, "tool_calls") and response_message.tool_calls:
+                has_tools = True
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": response_message.content,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments
+                            }
+                        } for tc in response_message.tool_calls
+                    ]
+                }
+                messages.append(assistant_msg)
+                
+                for tool_call in response_message.tool_calls:
+                    tool_name = tool_call.function.name
+                    try:
+                        tool_args = json.loads(tool_call.function.arguments)
+                    except json.JSONDecodeError:
+                        tool_args = {}
+                        
+                    if tool_name == "update_user_preference":
+                        key = tool_args.get("key")
+                        val = tool_args.get("value")
+                        prefs_dict = dict(user.preferences_json) if user.preferences_json else {}
+                        if key and val:
+                            prefs_dict[key] = val
+                            user.preferences_json = prefs_dict
+                            db.query(User).filter(User.id == user.id).update({"preferences_json": prefs_dict})
+                            db.commit()
+                        result = json.dumps({"status": "success", "key": key, "value": val})
+                    else:
+                        if tool_name in TOOLS_MAP:
+                            try:
+                                result = TOOLS_MAP[tool_name](**tool_args)
+                            except Exception as e:
+                                result = f"Error running tool: {str(e)}"
+                        else:
+                            result = f"Error: Tool {tool_name} not found."
                     
-                    for tool_call in response_message.tool_calls:
-                        tool_name = tool_call.function.name
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": tool_name,
+                        "content": str(result)
+                    })
+            
+            # Handle tools leaked into content
+            elif response_message.content and "<function=" in response_message.content:
+                pattern = r"<function=([a-zA-Z0-9_]+)[>\(]*(.*?)[<\)]*/?function>"
+                matches = list(re.finditer(pattern, response_message.content, re.DOTALL))
+                if matches:
+                    has_tools = True
+                    messages.append({"role": "assistant", "content": response_message.content})
+                    
+                    for m in matches:
+                        tool_name = m.group(1)
+                        tool_args_str = m.group(2)
+                        
+                        if tool_args_str.startswith('(') and tool_args_str.endswith(')'):
+                            tool_args_str = tool_args_str[1:-1]
+                            
                         try:
-                            tool_args = json.loads(tool_call.function.arguments)
+                            tool_args = json.loads(tool_args_str)
                         except json.JSONDecodeError:
                             tool_args = {}
                             
@@ -241,84 +291,20 @@ def process_message(db: Session, telegram_id: int, user_name: str, content: str,
                                 result = f"Error: Tool {tool_name} not found."
                         
                         messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": tool_name,
-                            "content": str(result)
+                            "role": "user",
+                            "content": f"System Action: Tool '{tool_name}' executed. Result: {result}"
                         })
-                    
-                    # Call Groq again with the tool results
-                    response = client.chat.completions.create(
-                        model=current_model,
-                        messages=messages,
-                        tools=GROQ_TOOLS,
-                        tool_choice="auto",
-                        parallel_tool_calls=False
-                    )
-                    response_message = response.choices[0].message
-                    continue
+            
+            if has_tools:
+                continue
                 
-                # Check for leaked tool calls in the content
-                elif response_message.content and "<function=" in response_message.content:
-                    pattern = r"<function=([a-zA-Z0-9_]+)[>\(]*(.*?)[<\)]*/?function>"
-                    matches = list(re.finditer(pattern, response_message.content, re.DOTALL))
-                    if matches:
-                        messages.append({"role": "assistant", "content": response_message.content})
-                        
-                        for m in matches:
-                            tool_name = m.group(1)
-                            tool_args_str = m.group(2)
-                            try:
-                                tool_args = json.loads(tool_args_str)
-                            except json.JSONDecodeError:
-                                tool_args = {}
-                                
-                            if tool_name == "update_user_preference":
-                                key = tool_args.get("key")
-                                val = tool_args.get("value")
-                                prefs_dict = dict(user.preferences_json) if user.preferences_json else {}
-                                if key and val:
-                                    prefs_dict[key] = val
-                                    user.preferences_json = prefs_dict
-                                    db.query(User).filter(User.id == user.id).update({"preferences_json": prefs_dict})
-                                    db.commit()
-                                result = json.dumps({"status": "success", "key": key, "value": val})
-                            else:
-                                if tool_name in TOOLS_MAP:
-                                    try:
-                                        result = TOOLS_MAP[tool_name](**tool_args)
-                                    except Exception as e:
-                                        result = f"Error running tool: {str(e)}"
-                                else:
-                                    result = f"Error: Tool {tool_name} not found."
-                            
-                            # Append result as user message to feed back to the model
-                            messages.append({
-                                "role": "user",
-                                "content": f"System Action: Tool '{tool_name}' executed. Result: {result}"
-                            })
-                            
-                        response = client.chat.completions.create(
-                            model=current_model,
-                            messages=messages,
-                            tools=GROQ_TOOLS,
-                            tool_choice="auto",
-                            parallel_tool_calls=False
-                        )
-                        response_message = response.choices[0].message
-                        continue
-                        
-                # No more tools to call
-                break
-                
+            # If no tools were found, we have our final text!
             final_text = response_message.content
             
-            # 5. Clean up any lingering raw function tags before showing to user
             if final_text:
                 final_text = re.sub(r"<function=.*?</function>", "", final_text, flags=re.DOTALL)
                 final_text = final_text.strip()
             
-            # 5. Save Assistant response
             asst_msg = Message(user_id=user.id, role="assistant", content=final_text)
             db.add(asst_msg)
             db.commit()
@@ -326,10 +312,59 @@ def process_message(db: Session, telegram_id: int, user_name: str, content: str,
             return final_text
     
         except Exception as e:
-            if "429" in str(e) and attempt == 0:
+            err_str = str(e)
+            
+            # Groq returns a 429 when rate limited
+            if "429" in err_str and rate_limit_retries < 2:
                 print("Rate limit (429) hit. Retrying in 5 seconds...")
+                rate_limit_retries += 1
                 time.sleep(5)
                 continue
+                
+            # Groq intercepts malformed tools on the backend and returns a 400 BadRequest with failed_generation
+            if "failed_generation" in err_str:
+                pattern = r"<function=([a-zA-Z0-9_]+)[>\(]*(.*?)[<\)]*/?function>"
+                matches = list(re.finditer(pattern, err_str, re.DOTALL))
+                if matches:
+                    messages.append({"role": "assistant", "content": "Let me process that information."})
+                    for m in matches:
+                        tool_name = m.group(1)
+                        tool_args_str = m.group(2)
+                        
+                        if tool_args_str.startswith('(') and tool_args_str.endswith(')'):
+                            tool_args_str = tool_args_str[1:-1]
+                            
+                        try:
+                            tool_args = json.loads(tool_args_str)
+                        except json.JSONDecodeError:
+                            tool_args = {}
+                            
+                        if tool_name == "update_user_preference":
+                            key = tool_args.get("key")
+                            val = tool_args.get("value")
+                            prefs_dict = dict(user.preferences_json) if user.preferences_json else {}
+                            if key and val:
+                                prefs_dict[key] = val
+                                user.preferences_json = prefs_dict
+                                db.query(User).filter(User.id == user.id).update({"preferences_json": prefs_dict})
+                                db.commit()
+                            result = json.dumps({"status": "success", "key": key, "value": val})
+                        else:
+                            if tool_name in TOOLS_MAP:
+                                try:
+                                    result = TOOLS_MAP[tool_name](**tool_args)
+                                except Exception as e:
+                                    result = f"Error running tool: {str(e)}"
+                            else:
+                                result = f"Error: Tool {tool_name} not found."
+                        
+                        messages.append({
+                            "role": "user",
+                            "content": f"System Action: Tool '{tool_name}' executed. Result: {result}"
+                        })
+                    # Loop back around to process the tool results
+                    continue
+                    
             traceback.print_exc()
             return f"I couldn't verify that right now. Error: {str(e)}"
 
